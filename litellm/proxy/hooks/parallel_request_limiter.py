@@ -693,6 +693,45 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
         except Exception as e:
             self.print_verbose(e)
 
+    async def _decrement_key_current_requests(self, api_key: str, parent_otel_span: Span | None) -> None:
+        """
+        Release one reserved concurrent-request slot for ``api_key``.
+
+        Shared by every path that must give back a slot ``async_pre_call_hook``
+        reserved: a completed LLM call (success or failure, via
+        ``async_log_success_event`` / ``async_log_failure_event``) and a request
+        that never reached an LLM call at all (via ``async_post_call_failure_hook``).
+        """
+        current_date: Final = datetime.now().strftime("%Y-%m-%d")
+        current_hour: Final = datetime.now().strftime("%H")
+        current_minute: Final = datetime.now().strftime("%M")
+        precise_minute: Final = f"{current_date}-{current_hour}-{current_minute}"
+
+        request_count_api_key: Final = f"{api_key}::{precise_minute}::request_count"
+
+        current: Final = await self.internal_usage_cache.async_get_cache(
+            key=request_count_api_key,
+            litellm_parent_otel_span=parent_otel_span,
+        ) or {
+            "current_requests": 1,
+            "current_tpm": 0,
+            "current_rpm": 0,
+        }
+
+        new_val: Final = {
+            "current_requests": max(current["current_requests"] - 1, 0),
+            "current_tpm": current["current_tpm"],
+            "current_rpm": current["current_rpm"],
+        }
+
+        self.print_verbose(f"updated_value releasing slot: {new_val}")
+        await self.internal_usage_cache.async_set_cache(
+            request_count_api_key,
+            new_val,
+            ttl=60,
+            litellm_parent_otel_span=parent_otel_span,
+        )  # save in cache for up to 1 min.
+
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
         try:
             self.print_verbose("Inside Max Parallel Request Failure Hook")
@@ -708,10 +747,6 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
             if CommonProxyErrors.max_parallel_request_limit_reached.value in str(kwargs["exception"]):
                 pass  # ignore failed calls due to max limit being reached
             else:
-                # ------------
-                # Setup values
-                # ------------
-
                 if global_max_parallel_requests is not None:
                     # get value from cache
                     _key: Final = "global_max_parallel_requests"
@@ -730,40 +765,41 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
                         litellm_parent_otel_span=litellm_parent_otel_span,
                     )
 
-                current_date: Final = datetime.now().strftime("%Y-%m-%d")
-                current_hour: Final = datetime.now().strftime("%H")
-                current_minute: Final = datetime.now().strftime("%M")
-                precise_minute: Final = f"{current_date}-{current_hour}-{current_minute}"
-
-                request_count_api_key: Final = f"{user_api_key}::{precise_minute}::request_count"
-
-                # ------------
-                # Update usage
-                # ------------
-                current: Final = await self.internal_usage_cache.async_get_cache(
-                    key=request_count_api_key,
-                    litellm_parent_otel_span=litellm_parent_otel_span,
-                ) or {
-                    "current_requests": 1,
-                    "current_tpm": 0,
-                    "current_rpm": 0,
-                }
-
-                new_val: Final = {
-                    "current_requests": max(current["current_requests"] - 1, 0),
-                    "current_tpm": current["current_tpm"],
-                    "current_rpm": current["current_rpm"],
-                }
-
-                self.print_verbose(f"updated_value in failure call: {new_val}")
-                await self.internal_usage_cache.async_set_cache(
-                    request_count_api_key,
-                    new_val,
-                    ttl=60,
-                    litellm_parent_otel_span=litellm_parent_otel_span,
-                )  # save in cache for up to 1 min.
+                await self._decrement_key_current_requests(user_api_key, litellm_parent_otel_span)
         except Exception as e:
             verbose_proxy_logger.exception("Inside Parallel Request Limiter: An exception occurred - %s", e)
+
+    async def async_post_call_failure_hook(
+        self,
+        request_data: dict,
+        original_exception: Exception,
+        user_api_key_dict: UserAPIKeyAuth,
+        traceback_str: str | None = None,
+    ) -> None:
+        """
+        Release the concurrent-request slot ``async_pre_call_hook`` reserved when a
+        request fails before ever reaching an LLM call attempt.
+
+        ``async_log_failure_event`` only fires once ``litellm.acompletion`` is
+        actually attempted, so a request rejected earlier -- e.g. an unresolvable
+        model name (``ProxyModelNotFoundError`` in ``route_llm_request.py``) --
+        leaves its slot reserved forever, eventually exhausting the key's
+        ``max_parallel_requests`` budget and 429-ing all future traffic on that
+        key. See https://github.com/BerriAI/litellm/issues/18060.
+
+        Scoped to ``ProxyModelNotFoundError``: the only exception type proven to
+        occur after a slot is reserved but before any LLM call is dispatched, so
+        this can never double-release a slot already released by
+        ``async_log_failure_event``.
+        """
+        from litellm.proxy.route_llm_request import ProxyModelNotFoundError
+
+        if not isinstance(original_exception, ProxyModelNotFoundError):
+            return
+        api_key: Final = user_api_key_dict.api_key
+        if api_key is None:
+            return
+        await self._decrement_key_current_requests(api_key, user_api_key_dict.parent_otel_span)
 
     async def get_internal_user_object(
         self,
